@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -248,10 +249,31 @@ class TestRender:
         assert "\n" not in page.split("# TYPE cswap_account_info gauge\n", 1)[1].split("\n", 1)[0]
         assert _get(_parse_page(page), "cswap_account_info", account="1", alias=alias) == 1
 
-    def test_prometheus_unicode_alias(self):
+    def test_prometheus_unicode_alias(self, monkeypatch):
         page = prometheus_output.render(_payload([_row(1, _usage(), alias="Équipe café")]))
         assert 'alias="Équipe café"' in page
-        assert page.encode("utf-8").decode("utf-8") == page
+        # Through a console that is not UTF-8, the page still goes out as UTF-8.
+        raw = io.BytesIO()
+        monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="cp1252"))
+        prometheus_output.write(page)
+        assert 'alias="Équipe café"'.encode("utf-8") in raw.getvalue()
+
+    def test_prometheus_overflow_and_lone_surrogate_never_raise(self, monkeypatch):
+        """Values no real payload carries still drop one sample, never the page."""
+        huge = _row(2, {"five_hour": {"pct": 1.0}})
+        huge["usage"]["fiveHour"]["pct"] = 10**400
+        bad_number = _row(3, _usage())
+        bad_number["number"] = 10**400
+        rows = [_row(1, _usage(), alias="x\ud800y"), huge, bad_number]
+        page = prometheus_output.render(_payload(rows))
+        p = _parse_page(page)
+        assert _get(p, "cswap_usage_ratio", account="2", window="five_hour") is None
+        assert _get(p, "cswap_usage_up", account="2") == 1
+        assert {s["account"] for s in _series(p, "cswap_account_info")} == {"1", "2"}
+        raw = io.BytesIO()
+        monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="utf-8"))
+        prometheus_output.write(page)
+        assert b'alias="x?y"' in raw.getvalue()
 
     def test_prometheus_token_expired_row_has_up_zero_and_status(self):
         payload = _payload([_row(1, USAGE_TOKEN_EXPIRED, login_expires_at="2026-11-01T00:00:00Z")])
@@ -569,3 +591,27 @@ class TestPrometheusCli:
         assert b"\r" not in out
         assert out.startswith(b"# HELP cswap_account_info")
         assert out.endswith(b"\n")
+
+
+class TestWrite:
+    def test_prometheus_write_keeps_lf_and_utf8_on_a_crlf_console(self, monkeypatch):
+        """A text stream that turns LF into CRLF (Windows) never sees the page."""
+        page = prometheus_output.render(_rich_payload())
+        raw = io.BytesIO()
+        monkeypatch.setattr(
+            sys, "stdout", io.TextIOWrapper(raw, encoding="cp1252", newline="\r\n")
+        )
+        prometheus_output.write(page)
+        assert raw.getvalue() == page.encode("utf-8")
+        assert b"\r" not in raw.getvalue()
+
+    def test_prometheus_write_falls_back_to_a_text_stream(self, monkeypatch):
+        page = prometheus_output.render(_rich_payload())
+        out = io.StringIO()
+        monkeypatch.setattr(sys, "stdout", out)
+        prometheus_output.write(page)
+        assert out.getvalue() == page
+
+    def test_prometheus_write_without_stdout_is_a_no_op(self, monkeypatch):
+        monkeypatch.setattr(sys, "stdout", None)
+        prometheus_output.write("# HELP x y\n")  # must not raise

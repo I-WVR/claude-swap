@@ -353,81 +353,28 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 
 `cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
 
-### Dashboards (Prometheus, Grafana and others)
+### Prometheus metrics (Grafana and other dashboards)
 
-`cswap list --prometheus` prints the same data as `list --json` in the Prometheus text format, which Grafana (through a Prometheus data source), node_exporter's textfile collector and similar tools can read. The page is written in one piece at the end: on an error stdout stays empty and the exit code is non-zero, so a scraper never reads half a page. cswap asks the usage API only when its stored reading is older than about 3 minutes, so a scrape every minute does not mean a request every minute.
+`cswap list --prometheus` prints the usage `list --json` reports in the Prometheus text format, for node_exporter's textfile collector and from there Prometheus, Grafana or any other dashboard that reads it. Accounts are named by slot number and alias only; no email, token or organization appears. The page is written once every row is ready, so on an error stdout is empty and the exit code is non-zero.
 
 ```bash
 cswap list --prometheus
 ```
 
 <details>
-<summary>Metrics, node_exporter and Grafana setup, privacy</summary>
+<summary>Metrics, setup & privacy</summary>
 
-Example (two accounts, trimmed to a few metrics):
+All metrics are gauges labelled by `account` (the slot number): `cswap_account_info` (with `alias`), `cswap_account_active`, `cswap_account_disabled`, `cswap_usage_up` (1 when `usageStatus` is `ok`) and `cswap_usage_status` (1 for the current `usageStatus`, 0 for the others). Per `window` (`five_hour`, `seven_day`, `seven_day_<model>`) there are `cswap_usage_ratio` (0 to 1), `cswap_usage_expected_ratio` (weekly windows) and `cswap_usage_reset_timestamp_seconds`, plus `cswap_usage_fetched_timestamp_seconds` and `cswap_login_expiry_timestamp_seconds` per account. While an account has no current reading its usage metrics are left out rather than shown stale; `cswap_usage_status` says why.
 
-```text
-# HELP cswap_account_info Managed account (1 per slot); account is the slot number, alias is empty when unset.
-# TYPE cswap_account_info gauge
-cswap_account_info{account="1",alias="work"} 1
-cswap_account_info{account="2",alias=""} 1
-# HELP cswap_account_active 1 for the active account, else 0.
-# TYPE cswap_account_active gauge
-cswap_account_active{account="1"} 0
-cswap_account_active{account="2"} 1
-# HELP cswap_usage_ratio Share of the window's quota used, from 0 to 1.
-# TYPE cswap_usage_ratio gauge
-cswap_usage_ratio{account="1",window="five_hour"} 0.25
-cswap_usage_ratio{account="1",window="seven_day"} 0.16
-cswap_usage_ratio{account="2",window="five_hour"} 0.5
-cswap_usage_ratio{account="2",window="seven_day"} 0.4
-# HELP cswap_usage_reset_timestamp_seconds When the window's quota resets, as a Unix timestamp.
-# TYPE cswap_usage_reset_timestamp_seconds gauge
-cswap_usage_reset_timestamp_seconds{account="1",window="five_hour"} 1782170999
+Run it from your own crontab (cswap will not run as root, so the textfile directory must be writable by you), with the full path `command -v cswap` prints, and rename into place so a failed run never empties the live file:
+
+```bash
+* * * * * cswap list --prometheus > /path/to/textfile/cswap.prom.tmp && mv /path/to/textfile/cswap.prom.tmp /path/to/textfile/cswap.prom
 ```
 
-All metrics are gauges. `account` is the slot number.
+cron does not read your shell profile, so set `XDG_DATA_HOME` or `CLAUDE_CONFIG_DIR` in the crontab if you use them; otherwise the page lists no accounts. A run does what `cswap list` does: it may refresh stored logins and it updates the usage cache, but it asks the usage API only when a reading is older than about 3 minutes. `node_textfile_mtime_seconds` shows a file that stopped updating. On Windows, run `cmd /c "cswap list --prometheus > cswap.prom.tmp && move /y cswap.prom.tmp cswap.prom"` in windows_exporter's textfile directory (Windows PowerShell 5.1 and PowerShell 7 before 7.4 rewrite `>` output, 5.1 as UTF-16 with CRLF). On macOS a LaunchAgent is safer than cron, which may not reach the login Keychain. In Grafana, use the unit Percent (0.0-1.0) for `cswap_usage_ratio`.
 
-| Metric | Labels | Meaning |
-|---|---|---|
-| `cswap_account_info` | `account`, `alias` | Always 1, one per account. `alias` is empty when unset. |
-| `cswap_account_active` | `account` | 1 for the active account, else 0. |
-| `cswap_account_disabled` | `account` | 1 when the account is held out of rotation with `cswap disable`, else 0. |
-| `cswap_usage_up` | `account` | 1 when the account has current usage (`usageStatus` is `ok`), else 0. |
-| `cswap_usage_status` | `account`, `status` | 1 for the account's `usageStatus` (as in `list --json`), 0 for the other known states. |
-| `cswap_usage_ratio` | `account`, `window` | Share of the window's quota used, from 0 to 1. `window` is `five_hour`, `seven_day` or `seven_day_<model>`. |
-| `cswap_usage_expected_ratio` | `account`, `window` | Share of the weekly quota that would be used by now at an even pace. Weekly windows only. |
-| `cswap_usage_reset_timestamp_seconds` | `account`, `window` | When the window's quota resets, as a Unix timestamp. |
-| `cswap_usage_fetched_timestamp_seconds` | `account` | When the usage measurement was taken, as a Unix timestamp. |
-| `cswap_login_expiry_timestamp_seconds` | `account` | When the stored login expires and needs a new `/login`, as a Unix timestamp. |
-
-Usage metrics appear only while the account has current usage. When it does not, the sample is left out instead of showing an old number; `cswap_usage_up` and `cswap_usage_status` tell you why.
-
-**node_exporter textfile collector.** Run this from cron, using the full path that `command -v cswap` prints (cron's `PATH` is short):
-
-```text
-* * * * * cswap list --prometheus > /var/lib/node_exporter/textfile/cswap.prom.tmp && mv /var/lib/node_exporter/textfile/cswap.prom.tmp /var/lib/node_exporter/textfile/cswap.prom
-```
-
-The temporary name does not end in `.prom`, so the collector ignores it, and a failing `cswap` never empties the live file. Use `node_textfile_mtime_seconds` to spot a file that stopped updating.
-
-A scrape does what `cswap list` does: it may refresh the active login's token and it updates the usage cache.
-
-**Windows.** Windows PowerShell 5.1 rewrites `>` output as UTF-16 with CRLF line endings, which the format does not allow. For windows_exporter's textfile collector, let `cmd` do the redirect and the rename:
-
-```text
-cmd /c "cswap list --prometheus > cswap.prom.tmp && move /y cswap.prom.tmp cswap.prom"
-```
-
-**macOS.** Prefer a LaunchAgent (`StartInterval` 60, running the same line through `/bin/sh -c`) over cron. Cron runs outside the login session and may not be able to read the Keychain that holds the active login.
-
-**Grafana.** Add Prometheus as a data source and graph `cswap_usage_ratio` with the unit Percent (0.0-1.0). You get one series per account and window.
-
-**Any other dashboard:** poll `cswap list --json`.
-
-**Privacy.** No email, token, organization name or organization id appears in any metric, because metrics often end up in long-lived, shared stores. An account is named by slot number and alias only. An alias cannot hold an email address (`@` is not allowed), but it can hold a person's name, so pick aliases you are happy to see on a shared dashboard.
-
-**Contract.** The output is additive: new metrics and labels may appear, and existing names and meanings stay.
+An alias is text you chose (cswap rejects `@`), so pick aliases you are happy to see on a shared dashboard. The contract is additive: new metrics and labels may appear; existing names and meanings stay.
 
 </details>
 

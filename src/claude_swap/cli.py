@@ -982,9 +982,9 @@ def main() -> None:
     argv = sys.argv[1:]
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
-        # `run` execs a child that takes over the terminal, and `--json`
-        # must stay machine-readable — never probe (and emit the OSC query)
-        # in either case.
+        # `run` execs a child that takes over the terminal, and `--json` /
+        # `--prometheus` must stay machine-readable: never probe (and emit the
+        # OSC query) in any of these cases.
         probe = cli_should_probe(argv, colors_enabled=printer.colors_enabled())
         name = cli_theme(load_ui_settings(paths.get_backup_root()).theme, colors=probe)
         printer.set_theme(name)
@@ -1118,9 +1118,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         "--prometheus",
         action="store_true",
         help=(
-            "With 'list': print usage as Prometheus text-format metrics for "
-            "dashboards (Grafana, node_exporter's textfile collector and "
-            "others). See README 'Dashboards'."
+            "With 'list': print usage as Prometheus text-format metrics. "
+            "See README 'Prometheus metrics'."
         ),
     )
     parser.add_argument(

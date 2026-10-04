@@ -3,7 +3,8 @@
 Turns the schema-v1 payload that ``list --json`` prints into an exposition page
 that Grafana's Prometheus data source, node_exporter's textfile collector and
 similar tools can read. The renderer is a pure function of that payload, so the
-two outputs cannot disagree; the CLI does the single write (see cli.py).
+two outputs cannot disagree; the CLI calls ``write`` once, after the payload is
+complete.
 
 Privacy: metrics land in long-lived, often shared stores, so an account is named
 by slot number and alias only. The renderer never reads ``email``,
@@ -68,7 +69,10 @@ def _format_value(value: object) -> str | None:
     """Go-ParseFloat-safe text for a number, or None when it must be dropped."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:  # an int beyond float range
+        return None
     if not math.isfinite(number):
         return None
     return str(int(number)) if number.is_integer() else repr(round(number, 6))
@@ -100,6 +104,16 @@ def _windows(usage: dict) -> list[tuple[str, dict, bool]]:
     return found
 
 
+def _ratio(pct: object) -> float | None:
+    """A percentage as a 0-1 ratio, or None for anything that is not a number."""
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        return None
+    try:
+        return pct / 100
+    except OverflowError:
+        return None
+
+
 def _timestamp(value: object) -> float | None:
     return parse_reset_ts(value) if isinstance(value, str) else None
 
@@ -117,9 +131,7 @@ def render(payload: dict) -> str:
     numbered: dict[int, dict] = {}
     for row in rows:
         number = row.get("number")
-        if isinstance(number, bool) or not isinstance(number, (int, float)):
-            continue
-        if not math.isfinite(number):
+        if _format_value(number) is None:
             continue
         numbered.setdefault(int(number), row)  # duplicate numbers: first wins
 
@@ -143,12 +155,10 @@ def render(payload: dict) -> str:
         if isinstance(usage, dict):
             for label, win, weekly in _windows(usage):
                 win_labels = acct + [("window", label)]
-                pct = win.get("pct")
-                if isinstance(pct, (int, float)) and not isinstance(pct, bool):
-                    add("cswap_usage_ratio", win_labels, pct / 100)
-                expected = win.get("expectedPct")
-                if weekly and isinstance(expected, (int, float)) and not isinstance(expected, bool):
-                    add("cswap_usage_expected_ratio", win_labels, expected / 100)
+                add("cswap_usage_ratio", win_labels, _ratio(win.get("pct")))
+                if weekly:
+                    add("cswap_usage_expected_ratio", win_labels,
+                        _ratio(win.get("expectedPct")))
                 add("cswap_usage_reset_timestamp_seconds", win_labels,
                     _timestamp(win.get("resetsAt")))
             add("cswap_usage_fetched_timestamp_seconds", acct,
@@ -168,12 +178,17 @@ def write(text: str) -> None:
 
     A text-mode stdout on Windows turns LF into CRLF, which the exposition
     format forbids, so the bytes go to the underlying buffer when there is one.
+    A character UTF-8 cannot carry (a lone surrogate in a hand-edited alias)
+    becomes ``?`` rather than failing the whole page. With no stdout at all
+    (pythonw, a detached process) there is nowhere to write, as with print().
     """
+    if sys.stdout is None:
+        return
     buffer = getattr(sys.stdout, "buffer", None)
     if buffer is None:
         sys.stdout.write(text)
         sys.stdout.flush()
         return
     sys.stdout.flush()
-    buffer.write(text.encode("utf-8"))
+    buffer.write(text.encode("utf-8", errors="replace"))
     buffer.flush()
