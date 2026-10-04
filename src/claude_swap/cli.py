@@ -1078,6 +1078,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s switch user@example.com
   %(prog)s list --token-status
   %(prog)s list --json
+  %(prog)s list --prometheus
   %(prog)s import-usage usage.json --hold 600  # adopt another machine's list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
@@ -1111,6 +1112,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=(
             "Emit machine-readable JSON to stdout (use with 'list', 'status', "
             "or 'switch'). See README 'JSON output for scripting'."
+        ),
+    )
+    parser.add_argument(
+        "--prometheus",
+        action="store_true",
+        help=(
+            "With 'list': print usage as Prometheus text-format metrics for "
+            "dashboards (Grafana, node_exporter's textfile collector and "
+            "others). See README 'Dashboards'."
         ),
     )
     parser.add_argument(
@@ -1337,6 +1347,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         # silently ignore it (a future additive field can add it).
         parser.error("--token-status cannot be combined with --json")
 
+    if args.prometheus and not args.list:
+        parser.error("--prometheus can only be used with 'list'")
+
+    if args.prometheus and args.json:
+        parser.error("--prometheus cannot be combined with --json")
+
+    if args.prometheus and args.token_status:
+        parser.error("--token-status cannot be combined with --prometheus")
+
     if args.strategy is not None and not args.switch:
         parser.error("--strategy can only be used with bare 'switch'")
 
@@ -1424,7 +1443,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.list:
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,
-                json_output=args.json,
+                json_output=args.json or args.prometheus,
             )
         elif args.switch:
             from claude_swap.settings import load_settings, parse_model_names
@@ -1489,29 +1508,41 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             sys.exit(menubar_run(switcher))
     except ClaudeSwitchError as e:
         # In JSON mode keep stdout pure JSON: emit the structured error envelope
-        # there (exit 1) instead of a red stderr line.
+        # there (exit 1) instead of a red stderr line. In --prometheus mode
+        # stdout stays empty on error so a scraper never ingests a partial page.
         if args.json:
             print(json.dumps(error_envelope(e), indent=2))
         else:
             error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
-        # Route the cancellation note to stderr in JSON mode so stdout stays
-        # parseable (the guarantee covers completion / handled errors, not Ctrl-C).
+        # Route the cancellation note to stderr in JSON and Prometheus mode so
+        # stdout stays parseable (the guarantee covers completion / handled
+        # errors, not Ctrl-C).
         print(
             f"\n{dimmed('Operation cancelled')}",
-            file=sys.stderr if args.json else sys.stdout,
+            file=sys.stderr if (args.json or args.prometheus) else sys.stdout,
         )
         sys.exit(130)
 
     if args.json and payload is not None:
         print(json.dumps(payload, indent=2))
 
+    if args.prometheus and payload is not None:
+        from claude_swap import prometheus_output
+
+        prometheus_output.write(prometheus_output.render(payload))
+
     # Passive update notification (never fails). Skipped after --purge so we
     # don't immediately recreate <backup_root>/cache/update_check.json inside
     # the directory we just deleted. Skipped after --upgrade as a safety guard
     # in case the dispatch is later refactored to fall through.
-    if not args.purge and not args.upgrade and not args.json:
+    if (
+        not args.purge
+        and not args.upgrade
+        and not args.json
+        and not args.prometheus
+    ):
         from claude_swap.update_check import check_for_update
 
         msg = check_for_update(__version__)
